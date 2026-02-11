@@ -1,0 +1,101 @@
+name: Test
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        perl: ['5.40', '5.38', '5.36', '5.34', '5.32', '5.30', '5.28', '5.26']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Perl ${{ matrix.perl }}
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+
+      - name: Install PostgreSQL (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql libpq-dev
+          sudo systemctl start postgresql
+          sudo -u postgres createuser -s "$USER"
+
+      - name: Install PostgreSQL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install postgresql@17
+          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          brew services start postgresql@17
+          sleep 3
+          createuser -s "$USER" || true
+
+      - name: Install deps
+        run: |
+          cpanm -n EV EV::MakeMaker Test::More
+
+      - name: Build and test
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          fi
+          perl Makefile.PL
+          make
+          make test
+
+  test-freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y perl5 gmake postgresql17-server postgresql17-client p5-EV
+            pkg install -y p5-App-cpanminus
+            cpanm -n EV::MakeMaker
+            sysrc postgresql_enable=YES
+            /usr/local/etc/rc.d/postgresql initdb
+            /usr/local/etc/rc.d/postgresql start
+            sleep 2
+            su -l postgres -c "createuser -s root"
+          run: |
+            perl Makefile.PL
+            gmake
+            gmake test
+
+  test-openbsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test on OpenBSD
+        uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg_add postgresql-server postgresql-client p5-EV
+            pkg_add curl
+            curl -L https://cpanmin.us | perl - App::cpanminus
+            cpanm -n EV::MakeMaker Test::More
+            mkdir -p /var/postgresql/data
+            chown _postgresql:_postgresql /var/postgresql/data
+            su -l _postgresql -c "initdb -D /var/postgresql/data"
+            su -l _postgresql -c "pg_ctl -D /var/postgresql/data -l /var/postgresql/logfile start"
+            sleep 2
+            su -l _postgresql -c "createuser -s root"
+          run: |
+            perl Makefile.PL
+            make
+            make test

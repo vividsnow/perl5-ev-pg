@@ -1,0 +1,11 @@
+0.01  2026-02-10
+    - Async queries via libpq (query, query_params)
+    - Prepared statements (prepare, query_prepared, describe_prepared)
+    - Pipeline mode with batched sync
+    - Single-row mode
+    - COPY IN/OUT
+    - LISTEN/NOTIFY
+    - Connection reset
+    - Notice receiver
+    - Short method aliases (q, qp, qx, prep, flush, sync, etc.)
+    - CI for Linux, macOS, FreeBSD, OpenBSD

@@ -1,0 +1,11 @@
+/CLAUDE.md
+/Makefile
+/MYMETA.*
+/META.*
+/Pg.c
+/Pg.o
+/Pg.bs
+/pm_to_blib
+/blib/
+/.build/
+/Makefile.old
