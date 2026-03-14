@@ -490,10 +490,12 @@ static void advance_cb_queue(ev_pg_t *self) {
 static void drain_notifies(ev_pg_t *self) {
     PGnotify *notify;
 
-    if (NULL == self->on_notify) return;
+    while (self->conn && (notify = PQnotifies(self->conn)) != NULL) {
+        if (NULL == self->on_notify) {
+            PQfreemem(notify);
+            continue;
+        }
 
-    while (self->conn && self->on_notify &&
-           (notify = PQnotifies(self->conn)) != NULL) {
         self->callback_depth++;
 
         {
@@ -877,10 +879,11 @@ static void cancel_pending(ev_pg_t *self, const char *errmsg) {
     ngx_queue_t *q;
     ev_pg_cb_t *cbt;
     unsigned int entry_magic = self->magic;
+    int remaining = self->pending_count;
 
     self->callback_depth++;
 
-    while (!ngx_queue_empty(&self->cb_queue)) {
+    while (remaining-- > 0 && !ngx_queue_empty(&self->cb_queue)) {
         q = ngx_queue_head(&self->cb_queue);
         cbt = ngx_queue_data(q, ev_pg_cb_t, queue);
 
@@ -1608,9 +1611,10 @@ CODE:
     if (len > (STRLEN)INT_MAX)
         croak("put_copy_data: data too large");
     RETVAL = PQputCopyData(self->conn, buf, (int)len);
-    if (RETVAL >= 0) {
+    if (RETVAL >= 0)
         check_flush(self);
-    }
+    else
+        handle_conn_loss(self);
 }
 OUTPUT:
     RETVAL
@@ -1625,9 +1629,10 @@ CODE:
         msg = SvPV_nolen(errmsg);
     }
     RETVAL = PQputCopyEnd(self->conn, msg);
-    if (RETVAL >= 0) {
+    if (RETVAL >= 0)
         check_flush(self);
-    }
+    else
+        handle_conn_loss(self);
 }
 OUTPUT:
     RETVAL
@@ -1651,8 +1656,12 @@ CODE:
          * process_results picks up the final COMMAND_OK result
          * (no new socket data will arrive to trigger it). */
         RETVAL = newSViv(-1);
-        if (self->loop)
+        if (self->loop) {
+            self->callback_depth++;
             ev_invoke(self->loop, &self->rio, EV_READ);
+            self->callback_depth--;
+            check_destroyed(self);
+        }
     }
     else if (len == -2) {
         croak("PQgetCopyData failed: %s", PQerrorMessage(self->conn));

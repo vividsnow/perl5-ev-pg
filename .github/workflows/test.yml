@@ -57,6 +57,36 @@ jobs:
           make
           make test
 
+  test-alpine:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          apk add --no-cache perl perl-dev make gcc musl-dev wget \
+            postgresql postgresql-dev postgresql-client perl-ev
+          wget -qO- https://cpanmin.us | perl - App::cpanminus
+          cpanm -n Alien::libpq EV::MakeMaker
+
+      - name: Start PostgreSQL
+        run: |
+          mkdir -p /run/postgresql /var/lib/postgresql/data
+          chown postgres:postgres /run/postgresql /var/lib/postgresql/data
+          su postgres -c "initdb -D /var/lib/postgresql/data"
+          su postgres -c "pg_ctl -D /var/lib/postgresql/data -l /var/lib/postgresql/logfile start"
+          sleep 2
+          su postgres -c "createuser -s root"
+
+      - name: Build and test
+        env:
+          TEST_PG_CONNINFO: dbname=postgres
+        run: |
+          perl Makefile.PL
+          make
+          make test
+
   test-freebsd:
     runs-on: ubuntu-latest
     steps:
