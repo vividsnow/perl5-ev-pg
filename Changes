@@ -1,4 +1,10 @@
-0.03  2026-03-16
+0.04  2026-03-23
+    - replace ngx_queue.h with inline singly-linked FIFO
+    - fix benchmark DBD::Pg async comparison
+    - additional tests and documentation fixes
+
+0.03  2026-03-17
+    - fix COPY skip/drain edge cases and idle ref accounting
     - hardening: skip_pending protocol safety, COPY drain, deferred PQfinish
     - fix notification memory leak when on_notify is unset
     - fix get_copy_data callback_depth and copy_mode lifecycle

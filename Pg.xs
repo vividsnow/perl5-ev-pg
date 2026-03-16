@@ -7,8 +7,6 @@
 #include <limits.h>
 #include <errno.h>
 
-#include "ngx_queue.h"
-
 typedef struct ev_pg_s ev_pg_t;
 typedef struct ev_pg_cb_s ev_pg_cb_t;
 
@@ -31,7 +29,7 @@ struct ev_pg_s {
     int      connecting;
     char    *conninfo;
 
-    ngx_queue_t cb_queue;
+    ev_pg_cb_t *cb_head, *cb_tail;
     int         pending_count;
     int         copy_mode;
     int         draining_single_row;
@@ -53,6 +51,7 @@ struct ev_pg_s {
 
     HV    *last_error_fields;
     HV    *last_result_meta;
+    PGresult *meta_res;
     FILE  *trace_fp;
 
 #ifdef LIBPQ_HAS_ASYNC_CANCEL
@@ -66,7 +65,7 @@ struct ev_pg_s {
 
 struct ev_pg_cb_s {
     SV          *cb;
-    ngx_queue_t  queue;
+    ev_pg_cb_t  *next;
     int          is_pipeline_sync;
     int          is_describe;
 };
@@ -124,12 +123,11 @@ static int  handle_conn_loss(ev_pg_t *self);
 
 static ev_pg_cb_t *cbt_freelist = NULL;
 
-/* Freelist: reuses first pointer-sized bytes as the next-link */
 static ev_pg_cb_t* alloc_cbt(void) {
     ev_pg_cb_t *cbt;
     if (cbt_freelist) {
         cbt = cbt_freelist;
-        cbt_freelist = *(ev_pg_cb_t **)cbt;
+        cbt_freelist = cbt->next;
     } else {
         Newx(cbt, 1, ev_pg_cb_t);
     }
@@ -137,7 +135,7 @@ static ev_pg_cb_t* alloc_cbt(void) {
 }
 
 static void release_cbt(ev_pg_cb_t *cbt) {
-    *(ev_pg_cb_t **)cbt = cbt_freelist;
+    cbt->next = cbt_freelist;
     cbt_freelist = cbt;
 }
 
@@ -378,17 +376,15 @@ static void emit_error(ev_pg_t *self, const char *msg) {
 /* Takes ownership of res.  Returns 1 if the cbt was already
  * removed from the queue (e.g. cancel_pending ran inside callback). */
 static int deliver_result(ev_pg_t *self, PGresult *res) {
-    ngx_queue_t *q;
     ev_pg_cb_t *cbt;
     ExecStatusType st;
 
-    if (ngx_queue_empty(&self->cb_queue)) {
+    if (!self->cb_head) {
         PQclear(res);
         return 0;
     }
 
-    q = ngx_queue_head(&self->cb_queue);
-    cbt = ngx_queue_data(q, ev_pg_cb_t, queue);
+    cbt = self->cb_head;
 
     st = PQresultStatus(res);
 
@@ -466,11 +462,11 @@ static int deliver_result(ev_pg_t *self, PGresult *res) {
             int ncols = PQnfields(res);
             AV *rows = newAV();
             int r, c;
-            /* Metadata is identical for every row in streaming mode;
-             * rebuild on TUPLES_OK (always) or first delivery of a new
-             * query (meta_fresh is cleared by advance_cb_queue) */
+            /* Defer metadata building until result_meta is called.
+             * In streaming mode, capture only the first result per query
+             * (meta_fresh is cleared by advance_cb_queue). */
             if (st == PGRES_TUPLES_OK || !self->meta_fresh) {
-                STORE_LAST_HV(self->last_result_meta, build_result_meta(res));
+                RELEASE_LAST_HV(self->last_result_meta);
                 self->meta_fresh = 1;
             }
             if (nrows > 0) av_extend(rows, nrows - 1);
@@ -492,17 +488,22 @@ static int deliver_result(ev_pg_t *self, PGresult *res) {
         else {
             /* COMMAND_OK — pass cmd_tuples string */
             const char *ct = PQcmdTuples(res);
-            STORE_LAST_HV(self->last_result_meta, build_result_meta(res));
+            RELEASE_LAST_HV(self->last_result_meta);
             PUSHs(sv_2mortal(newSVpv(ct ? ct : "", 0)));
         }
 
         PUTBACK;
+
+        /* Defer PQclear — keep result for lazy result_meta.
+         * Must happen before callback so result_meta works inside callbacks. */
+        if (self->meta_res) PQclear(self->meta_res);
+        self->meta_res = res;
+
         CALL_SV_GUARDED(cbt->cb, "callback");
         FREETMPS;
         LEAVE;
     }
 
-    PQclear(res);
     {
         int consumed = (self->delivering_cbt == NULL);
         self->delivering_cbt = NULL;
@@ -512,15 +513,13 @@ static int deliver_result(ev_pg_t *self, PGresult *res) {
 }
 
 static void advance_cb_queue(ev_pg_t *self) {
-    ngx_queue_t *q;
     ev_pg_cb_t *cbt;
 
-    if (ngx_queue_empty(&self->cb_queue)) return;
+    if (!self->cb_head) return;
 
-    q = ngx_queue_head(&self->cb_queue);
-    cbt = ngx_queue_data(q, ev_pg_cb_t, queue);
-
-    ngx_queue_remove(q);
+    cbt = self->cb_head;
+    self->cb_head = cbt->next;
+    if (!self->cb_head) self->cb_tail = NULL;
     self->pending_count--;
     self->meta_fresh = 0;
     SvREFCNT_dec(cbt->cb);
@@ -586,22 +585,28 @@ static void process_results(ev_pg_t *self) {
                 return;
             }
         }
+        /* OUT phase complete — clear bit so retries skip it */
+        self->draining_copy &= ~1;
         if (self->draining_copy & 2) {  /* IN or BOTH */
             int ce = PQputCopyEnd(self->conn, "skipped");
-            if (ce == 0) {
-                check_flush(self);
-                self->pending_result = last_res;
+            if (ce == -1) {
+                self->draining_copy = 0;
+                if (last_res) PQclear(last_res);
+                handle_conn_loss(self);
                 return;
             }
-            if (ce >= 0) {
-                check_flush(self);
-                if (self->magic != EV_PG_MAGIC || !self->conn) {
-                    if (last_res) PQclear(last_res);
-                    return;
-                }
+            /* ce == 0: END queued, flush pending; ce > 0: END sent.
+             * Either way, asyncStatus is already PGASYNC_BUSY — do not
+             * retry PQputCopyEnd; just flush and let the main loop
+             * consume COMMAND_OK when it arrives. */
+            check_flush(self);
+            if (self->magic != EV_PG_MAGIC || !self->conn) {
+                if (last_res) PQclear(last_res);
+                return;
             }
         }
         self->draining_copy = 0;
+        update_idle_ref(self);
     }
 
     while (self->conn && !PQisBusy(self->conn)) {
@@ -630,15 +635,13 @@ static void process_results(ev_pg_t *self) {
                     continue;
                 }
 
-                int consumed = 0;
                 self->copy_mode = 0;
-                consumed = deliver_result(self, last_res);
+                int consumed = deliver_result(self, last_res);
                 last_res = NULL;
                 if (self->magic != EV_PG_MAGIC) return;
 
-                if (!consumed && !ngx_queue_empty(&self->cb_queue)) {
-                    ngx_queue_t *q = ngx_queue_head(&self->cb_queue);
-                    ev_pg_cb_t *cbt = ngx_queue_data(q, ev_pg_cb_t, queue);
+                if (!consumed && self->cb_head) {
+                    ev_pg_cb_t *cbt = self->cb_head;
                     if (!cbt->is_pipeline_sync) {
                         advance_cb_queue(self);
                     } else {
@@ -651,7 +654,7 @@ static void process_results(ev_pg_t *self) {
 
             if (self->copy_mode) break;
 
-            if (ngx_queue_empty(&self->cb_queue)) break;
+            if (!self->cb_head) break;
             continue;
         }
 
@@ -685,17 +688,21 @@ static void process_results(ev_pg_t *self) {
                         /* rc == -1: COPY done, rc == 0: would block */
                         if (rc == 0) {
                             self->draining_copy = (st == PGRES_COPY_BOTH) ? 3 : 1;
+                            update_idle_ref(self);
                             continue;
                         }
                     }
                     if (st == PGRES_COPY_IN || st == PGRES_COPY_BOTH) {
                         int ce = PQputCopyEnd(self->conn, "skipped");
-                        if (ce == 0) {
-                            /* Buffer full — defer to next write event */
-                            self->draining_copy = 2;
-                            continue;
+                        if (ce == -1) {
+                            if (last_res) PQclear(last_res);
+                            handle_conn_loss(self);
+                            return;
                         }
-                        if (ce >= 0) check_flush(self);
+                        /* ce == 0: END queued, flush pending; ce > 0: END sent.
+                         * asyncStatus is already PGASYNC_BUSY — fall through to
+                         * drain COMMAND_OK (or set draining_single_row if busy). */
+                        check_flush(self);
                         if (self->magic != EV_PG_MAGIC || !self->conn) {
                             if (last_res) PQclear(last_res);
                             return;
@@ -709,8 +716,10 @@ static void process_results(ev_pg_t *self) {
                     }
                     if (drained)
                         self->skip_results--;
-                    else
+                    else {
                         self->draining_single_row = 1;
+                        update_idle_ref(self);
+                    }
                     continue;
                 }
                 self->copy_mode = 1;
@@ -747,8 +756,10 @@ static void process_results(ev_pg_t *self) {
                     }
                     if (drained)
                         self->skip_results--;
-                    else
+                    else {
                         self->draining_single_row = 1;
+                        update_idle_ref(self);
+                    }
                     continue;
                 }
                 PGconn *orig_conn = self->conn;
@@ -771,6 +782,7 @@ static void process_results(ev_pg_t *self) {
                         /* PQisBusy interrupted drain; residual results
                          * remain in libpq buffer — flag for later. */
                         self->draining_single_row = 1;
+                        update_idle_ref(self);
                     }
                     if (last_res != NULL) {
                         PQclear(last_res);
@@ -885,7 +897,15 @@ static void io_write_cb(EV_P_ ev_io *w, int revents) {
     ret = PQflush(self->conn);
     if (ret == 0) {
         stop_writing(self);
-        if (self->copy_mode && self->on_drain != NULL) {
+        if (self->draining_copy) {
+            process_results(self);
+            if (self->magic != EV_PG_MAGIC) {
+                self->callback_depth--;
+                check_destroyed(self);
+                return;
+            }
+        }
+        else if (self->copy_mode && self->on_drain != NULL) {
             dSP;
             ENTER;
             SAVETMPS;
@@ -1027,6 +1047,10 @@ static void cleanup_connection(ev_pg_t *self) {
         PQclear(self->pending_result);
         self->pending_result = NULL;
     }
+    if (self->meta_res) {
+        PQclear(self->meta_res);
+        self->meta_res = NULL;
+    }
 
     if (self->trace_fp) {
         if (self->conn) PQuntrace(self->conn);
@@ -1050,7 +1074,6 @@ static void cleanup_connection(ev_pg_t *self) {
 }
 
 static void cancel_pending(ev_pg_t *self, const char *errmsg) {
-    ngx_queue_t *q;
     ev_pg_cb_t *cbt;
     unsigned int entry_magic = self->magic;
     int remaining = self->pending_count;
@@ -1059,13 +1082,13 @@ static void cancel_pending(ev_pg_t *self, const char *errmsg) {
 
     self->callback_depth++;
 
-    while (remaining-- > 0 && !ngx_queue_empty(&self->cb_queue)) {
-        q = ngx_queue_head(&self->cb_queue);
-        cbt = ngx_queue_data(q, ev_pg_cb_t, queue);
+    while (remaining-- > 0 && self->cb_head) {
+        cbt = self->cb_head;
+        self->cb_head = cbt->next;
+        if (!self->cb_head) self->cb_tail = NULL;
 
         if (cbt == self->delivering_cbt) {
             /* Currently being delivered; remove without re-firing */
-            ngx_queue_remove(q);
             self->pending_count--;
             if (NULL != cbt->cb) SvREFCNT_dec(cbt->cb);
             release_cbt(cbt);
@@ -1073,7 +1096,6 @@ static void cancel_pending(ev_pg_t *self, const char *errmsg) {
             continue;
         }
 
-        ngx_queue_remove(q);
         self->pending_count--;
 
         if (NULL != cbt->cb) {
@@ -1095,10 +1117,10 @@ static void cancel_pending(ev_pg_t *self, const char *errmsg) {
 
         if (self->magic != entry_magic) {
             /* DESTROY fired from inside callback; drain remaining silently */
-            while (!ngx_queue_empty(&self->cb_queue)) {
-                q = ngx_queue_head(&self->cb_queue);
-                cbt = ngx_queue_data(q, ev_pg_cb_t, queue);
-                ngx_queue_remove(q);
+            while (self->cb_head) {
+                cbt = self->cb_head;
+                self->cb_head = cbt->next;
+                if (!self->cb_head) self->cb_tail = NULL;
                 self->pending_count--;
                 if (NULL != cbt->cb) SvREFCNT_dec(cbt->cb);
                 release_cbt(cbt);
@@ -1116,7 +1138,10 @@ static ev_pg_cb_t* push_cb(ev_pg_t *self, SV *cb, int is_sync) {
     cbt->cb = SvREFCNT_inc(cb);
     cbt->is_pipeline_sync = is_sync;
     cbt->is_describe = 0;
-    ngx_queue_insert_tail(&self->cb_queue, &cbt->queue);
+    cbt->next = NULL;
+    if (self->cb_tail) self->cb_tail->next = cbt;
+    else self->cb_head = cbt;
+    self->cb_tail = cbt;
     self->pending_count++;
     update_idle_ref(self);
     return cbt;
@@ -1334,7 +1359,7 @@ CODE:
 #ifdef LIBPQ_HAS_ASYNC_CANCEL
     RETVAL->cancel_fd = -1;
 #endif
-    ngx_queue_init(&RETVAL->cb_queue);
+    /* cb_head/cb_tail already NULL from Newxz */
 }
 OUTPUT:
     RETVAL
@@ -1358,6 +1383,7 @@ CODE:
         if (self->cancel_cb) SvREFCNT_dec(self->cancel_cb);
 #endif
         if (self->pending_result) PQclear(self->pending_result);
+        if (self->meta_res) PQclear(self->meta_res);
         if (self->trace_fp) {
             if (self->conn) PQuntrace(self->conn);
             fclose(self->trace_fp);
@@ -1372,13 +1398,13 @@ CODE:
         RELEASE_HANDLER(self->on_drain);
         RELEASE_LAST_HV(self->last_error_fields);
         RELEASE_LAST_HV(self->last_result_meta);
-        while (!ngx_queue_empty(&self->cb_queue)) {
-            ngx_queue_t *q = ngx_queue_head(&self->cb_queue);
-            ev_pg_cb_t *cbt = ngx_queue_data(q, ev_pg_cb_t, queue);
-            ngx_queue_remove(q);
+        while (self->cb_head) {
+            ev_pg_cb_t *cbt = self->cb_head;
+            self->cb_head = cbt->next;
             if (cbt->cb) SvREFCNT_dec(cbt->cb);
             Safefree(cbt);
         }
+        self->cb_tail = NULL;
         Safefree(self);
         return;
     }
@@ -1387,6 +1413,10 @@ CODE:
         PQclear(self->pending_result);
         self->pending_result = NULL;
     }
+    if (self->meta_res) {
+        PQclear(self->meta_res);
+        self->meta_res = NULL;
+    }
     CLEANUP_CANCEL(self);
 
     {
@@ -1394,6 +1424,7 @@ CODE:
         self->conn = NULL;
         self->loop = NULL;
         self->fd = -1;
+        if (self->trace_fp && conn) PQuntrace(conn);
         if (conn) PQfinish(conn);
         if (self->conn_to_finish) {
             PQfinish(self->conn_to_finish);
@@ -1522,7 +1553,7 @@ CODE:
         cleanup_connection(self);
         /* Drain any callbacks re-enqueued during cancel_pending;
          * conn is NULL now so retries will croak "not connected" */
-        if (!ngx_queue_empty(&self->cb_queue)) {
+        if (self->cb_head) {
             cancel_pending(self, "connection reset");
             if (self->magic != EV_PG_MAGIC) {
                 check_destroyed(self);
@@ -1544,7 +1575,7 @@ CODE:
     }
     cleanup_connection(self);
     /* Drain any callbacks re-enqueued during cancel_pending */
-    if (!ngx_queue_empty(&self->cb_queue)) {
+    if (self->cb_head) {
         cancel_pending(self, "connection finished");
         if (self->magic != EV_PG_MAGIC) {
             check_destroyed(self);
@@ -2273,6 +2304,9 @@ SV*
 result_meta(EV::Pg self)
 CODE:
 {
+    if (self->meta_res && !self->last_result_meta) {
+        STORE_LAST_HV(self->last_result_meta, build_result_meta(self->meta_res));
+    }
     if (self->last_result_meta)
         RETVAL = newRV_inc((SV*)self->last_result_meta);
     else
