@@ -239,6 +239,7 @@ static void cleanup_cancel(ev_pg_t *self) {
         ENTER;
         SAVETMPS;
         PUSHMARK(SP);
+        XPUSHs(&PL_sv_undef);
         XPUSHs(sv_2mortal(newSVpv("connection closed", 0)));
         PUTBACK;
         CALL_SV_GUARDED(cb, "cancel_async cleanup");
@@ -296,7 +297,7 @@ static void cancel_poll_cb(EV_P_ ev_io *w, int revents) {
             ENTER;
             SAVETMPS;
             PUSHMARK(SP);
-            /* success: no args (Perl sees ($err) = @_ → $err = undef) */
+            XPUSHs(sv_2mortal(newSViv(1)));
             PUTBACK;
             CALL_SV_GUARDED(cb, "cancel_async callback");
             FREETMPS;
@@ -318,6 +319,7 @@ static void cancel_poll_cb(EV_P_ ev_io *w, int revents) {
             ENTER;
             SAVETMPS;
             PUSHMARK(SP);
+            XPUSHs(&PL_sv_undef);
             XPUSHs(sv_2mortal(errsv));
             PUTBACK;
             CALL_SV_GUARDED(cb, "cancel_async callback");
@@ -935,6 +937,10 @@ static void reinit_io_watchers(ev_pg_t *self) {
     stop_reading(self);
     stop_writing(self);
 
+    /* notice_receiver firing during the prior PQconnectPoll could have
+     * triggered finish() in user code, nulling self->conn */
+    if (NULL == self->conn) { self->fd = -1; return; }
+
     self->fd = PQsocket(self->conn);
     if (self->fd < 0) return;
 
@@ -1051,6 +1057,9 @@ static void cleanup_connection(ev_pg_t *self) {
         PQclear(self->meta_res);
         self->meta_res = NULL;
     }
+    /* meta_res is gone — drop the lazily-built cache too, otherwise
+     * result_meta would keep returning the previous connection's data */
+    RELEASE_LAST_HV(self->last_result_meta);
 
     if (self->trace_fp) {
         if (self->conn) PQuntrace(self->conn);
@@ -1332,8 +1341,17 @@ static const char** marshal_params(AV *params, int nparams,
         SV **svp = av_fetch(params, i, 0);
         if (svp) {
             SvGETMAGIC(*svp);
-            if (SvOK(*svp))
-                pv[i] = SvPV_nolen(*svp);
+            if (SvOK(*svp)) {
+                STRLEN len;
+                const char *s = SvPV(*svp, len);
+                if (memchr(s, '\0', len)) {
+                    if (pv != stack_buf) Safefree(pv);
+                    croak("parameter %d contains NUL byte; "
+                          "text-format params cannot contain NULs "
+                          "(use escape_bytea for binary data)", i);
+                }
+                pv[i] = s;
+            }
         }
     }
 
@@ -1359,7 +1377,6 @@ CODE:
 #ifdef LIBPQ_HAS_ASYNC_CANCEL
     RETVAL->cancel_fd = -1;
 #endif
-    /* cb_head/cb_tail already NULL from Newxz */
 }
 OUTPUT:
     RETVAL
@@ -1390,7 +1407,7 @@ CODE:
         }
         if (self->conn) PQfinish(self->conn);
         if (self->conn_to_finish) PQfinish(self->conn_to_finish);
-        if (NULL != self->conninfo) Safefree(self->conninfo);
+        Safefree(self->conninfo);
         RELEASE_HANDLER(self->on_connect);
         RELEASE_HANDLER(self->on_error);
         RELEASE_HANDLER(self->on_notify);
@@ -1441,11 +1458,8 @@ CODE:
     RELEASE_HANDLER(self->on_drain);
     RELEASE_LAST_HV(self->last_error_fields);
     RELEASE_LAST_HV(self->last_result_meta);
-    if (self->trace_fp) { fclose(self->trace_fp); self->trace_fp = NULL; }
-    if (NULL != self->conninfo) {
-        Safefree(self->conninfo);
-        self->conninfo = NULL;
-    }
+    if (self->trace_fp) fclose(self->trace_fp);
+    Safefree(self->conninfo);
 
     if (self->callback_depth == 0)
         Safefree(self);
@@ -1460,7 +1474,7 @@ CODE:
         croak("already connected");
     }
 
-    if (NULL != self->conninfo) Safefree(self->conninfo);
+    Safefree(self->conninfo);
     self->conninfo = savepv(conninfo);
 
     begin_connect(self, conninfo, "connection");
@@ -1492,20 +1506,20 @@ CODE:
     keywords[i] = NULL;
     values[i] = NULL;
 
-    if (NULL != self->conninfo) Safefree(self->conninfo);
-    self->conninfo = NULL;
-
     self->conn = PQconnectStartParams(keywords, values, expand_dbname);
     Safefree(keywords);
     Safefree(values);
     setup_new_conn(self, "connection");
 
-    /* store conninfo for reset — reconstruct from live connection */
+    /* store conninfo for reset — reconstruct from live connection.
+     * Replace the old conninfo only after the new one is in hand, so
+     * an OOM in PQconninfo doesn't strand the user with no reset path. */
     {
         PQconninfoOption *opts = PQconninfo(self->conn);
         if (opts) {
             SV *buf = newSVpvs("");
             PQconninfoOption *o;
+            char *new_conninfo;
             for (o = opts; o->keyword; o++) {
                 if (o->val && o->val[0]) {
                     if (SvCUR(buf) > 0) sv_catpvs(buf, " ");
@@ -1526,9 +1540,13 @@ CODE:
                 }
             }
             PQconninfoFree(opts);
-            self->conninfo = savepv(SvPV_nolen(buf));
+            new_conninfo = savepv(SvPV_nolen(buf));
             SvREFCNT_dec(buf);
+            Safefree(self->conninfo);
+            self->conninfo = new_conninfo;
         }
+        /* If PQconninfo returned NULL (OOM), keep the previous conninfo
+         * so reset() still works.  reset() uses the same parameters. */
     }
 }
 

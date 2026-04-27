@@ -57,6 +57,37 @@ jobs:
           make
           make test
 
+  valgrind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+
+      - name: Install PostgreSQL and valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql libpq-dev valgrind
+          sudo systemctl start postgresql
+          sudo -u postgres createuser -s "$USER"
+
+      - name: Install deps
+        run: cpanm -n Alien::libpq EV EV::MakeMaker
+
+      - name: Build
+        run: |
+          perl Makefile.PL
+          make
+
+      - name: Run leak suite under valgrind
+        env:
+          TEST_PG_CONNINFO: dbname=postgres
+          EV_PG_VALGRIND: 1
+        run: prove -bv xt/valgrind.t
+
   test-alpine:
     runs-on: ubuntu-latest
     container: alpine:latest
