@@ -7,7 +7,7 @@ use lib 't';
 use TestHelper;
 
 require_pg;
-plan tests => 11;
+plan tests => 12;
 
 # Test that objects are properly cleaned up
 {
@@ -182,6 +182,27 @@ plan tests => 11;
     my $t = EV::timer(5, 0, sub { EV::break });
     EV::run;
     ok($finished, 'COPY OUT cycle without leak');
+}
+
+# Regression: cancel_async cb that drops the only $pg ref while finish()
+# is running through cleanup_connection.  Prior to the cleanup_connection
+# depth-bump fix this was a use-after-free (8 invalid reads/writes under
+# valgrind) because DESTROY would Safefree(self) at depth 0 while
+# cleanup_connection was still executing.
+SKIP: {
+    skip 'requires libpq >= 17', 1 unless EV::Pg->lib_version >= 170000;
+    my $pg = EV::Pg->new(conninfo => $conninfo,
+                         on_connect => sub { EV::break });
+    my $t = EV::timer(5, 0, sub { EV::break });
+    EV::run;
+    # release closures so $pg holds the only Perl-level ref
+    $pg->on_connect(undef);
+    $pg->on_error(undef);
+
+    $pg->query("select pg_sleep(30)", sub {});
+    $pg->cancel_async(sub { undef $pg });
+    $pg->finish;  # used to UAF on the line after CLEANUP_CANCEL
+    ok(!defined $pg, 'cancel-cb-drops-pg + finish: no UAF, $pg cleared');
 }
 
 # Pipeline cycle with prepared statement

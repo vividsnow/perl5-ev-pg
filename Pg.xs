@@ -82,7 +82,7 @@ static int  deliver_result(ev_pg_t *self, PGresult *res);
 static void process_results(ev_pg_t *self);
 static void check_flush(ev_pg_t *self);
 static void emit_error(ev_pg_t *self, const char *msg);
-static void cleanup_connection(ev_pg_t *self);
+static int  cleanup_connection(ev_pg_t *self);
 static HV*  build_error_fields(PGresult *res);
 static HV*  build_result_meta(PGresult *res);
 static void cancel_pending(ev_pg_t *self, const char *errmsg);
@@ -825,7 +825,7 @@ static int handle_conn_loss(ev_pg_t *self) {
     if (check_destroyed(self)) return 1;
     /* If on_error called reset/finish, conn has already changed */
     if (self->conn == old_conn) {
-        cleanup_connection(self);
+        if (cleanup_connection(self)) return check_destroyed(self);
         cancel_pending(self, "connection lost");
     }
     return check_destroyed(self);
@@ -1022,7 +1022,7 @@ static void connect_poll_cb(EV_P_ ev_io *w, int revents) {
         if (self->magic != EV_PG_MAGIC) break;
         /* If on_error called reset, conn has already changed */
         if (self->conn == old_conn) {
-            cleanup_connection(self);
+            if (cleanup_connection(self)) break;
             cancel_pending(self, "connection failed");
         }
         break;
@@ -1037,8 +1037,12 @@ out:
     check_destroyed(self);
 }
 
-static void cleanup_connection(ev_pg_t *self) {
+/* Returns 1 if self was destroyed during cleanup (cancel callback
+ * dropped the last ref).  Callers must then check_destroyed and bail
+ * out without further use of self. */
+static int cleanup_connection(ev_pg_t *self) {
     PGconn *conn;
+    int outer_depth;
 
     stop_reading(self);
     stop_writing(self);
@@ -1047,7 +1051,17 @@ static void cleanup_connection(ev_pg_t *self) {
     self->copy_mode = 0;
     self->draining_single_row = 0;
     self->draining_copy = 0;
+
+    /* CLEANUP_CANCEL fires the user's cancel callback (if any).  If
+     * that callback drops the last $pg ref, DESTROY runs synchronously
+     * and would Safefree(self) at depth 0 — leaving the rest of this
+     * function reading freed memory.  Bump callback_depth across it so
+     * DESTROY defers the free until our caller's check_destroyed. */
+    outer_depth = self->callback_depth;
+    self->callback_depth++;
     CLEANUP_CANCEL(self);
+    self->callback_depth--;
+    if (self->magic != EV_PG_MAGIC) return 1;
 
     if (self->pending_result) {
         PQclear(self->pending_result);
@@ -1071,7 +1085,7 @@ static void cleanup_connection(ev_pg_t *self) {
     self->conn = NULL;
     self->skip_results = 0;
     if (conn) {
-        if (self->callback_depth > 0) {
+        if (outer_depth > 0) {
             /* Defer PQfinish — we may be inside libpq (e.g. notice_receiver) */
             if (self->conn_to_finish)
                 PQfinish(self->conn_to_finish);
@@ -1080,6 +1094,7 @@ static void cleanup_connection(ev_pg_t *self) {
             PQfinish(conn);
         }
     }
+    return 0;
 }
 
 static void cancel_pending(ev_pg_t *self, const char *errmsg) {
@@ -1568,7 +1583,10 @@ CODE:
     }
     /* If a cancel callback already called reset, conn has changed */
     if (self->conn == old_conn) {
-        cleanup_connection(self);
+        if (cleanup_connection(self)) {
+            check_destroyed(self);
+            return;
+        }
         /* Drain any callbacks re-enqueued during cancel_pending;
          * conn is NULL now so retries will croak "not connected" */
         if (self->cb_head) {
@@ -1591,7 +1609,10 @@ CODE:
         check_destroyed(self);
         return;
     }
-    cleanup_connection(self);
+    if (cleanup_connection(self)) {
+        check_destroyed(self);
+        return;
+    }
     /* Drain any callbacks re-enqueued during cancel_pending */
     if (self->cb_head) {
         cancel_pending(self, "connection finished");

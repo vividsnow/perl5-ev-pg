@@ -1,3 +1,6 @@
+0.06  2026-04-27
+    - fix UAF in cleanup_connection when cancel callback drops last $pg ref
+
 0.05  2026-04-27
     - hardening, expanded leak coverage, valgrind harness, doc polish
 
