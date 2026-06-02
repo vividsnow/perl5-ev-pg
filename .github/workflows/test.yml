@@ -151,6 +151,12 @@ jobs:
         with:
           usesh: true
           prepare: |
+            # OpenBSD 7.9's default SysV semaphore caps (semmns=60) are too low
+            # even for initdb's bootstrap backend ("could not create semaphores"),
+            # so raise them BEFORE initdb and the postmaster start.  Print the
+            # effective values for diagnosis.
+            sysctl kern.seminfo.semmni=256 kern.seminfo.semmns=4096 kern.seminfo.semmnu=256 || true
+            sysctl kern.seminfo.semmni kern.seminfo.semmns
             pkg_add postgresql-server postgresql-client p5-EV
             pkg_add curl
             curl -L https://cpanmin.us | perl - App::cpanminus
