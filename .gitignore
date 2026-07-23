@@ -9,6 +9,7 @@
 /blib/
 /.build/
 /Makefile.old
+/.pcg/
 *.tar.gz
 *~
 *.bak
