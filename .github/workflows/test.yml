@@ -8,11 +8,17 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         perl: ['5.40', '5.38', '5.36', '5.34', '5.32', '5.30', '5.28', '5.26']
+        include:
+          - os: ubuntu-latest
+            perl: '5.22'
+          - os: ubuntu-latest
+            perl: '5.14'
 
     steps:
       - uses: actions/checkout@v4
@@ -57,8 +63,76 @@ jobs:
           make
           make test
 
+      - name: Show libpq version
+        run: perl -Mblib -MEV::Pg -MAlien::libpq -e 'printf "headers %s, runtime %d\n", Alien::libpq->version, EV::Pg->lib_version'
+
+  test-pg14:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+
+      - name: Install PostgreSQL 14
+        run: |
+          sudo apt-get update
+          v=$(apt-cache madison libpq-dev | awk '$3 ~ /^14\./ { print $3; exit }')
+          test -n "$v"
+          sudo apt-get install -y --allow-downgrades postgresql "libpq-dev=$v" "libpq5=$v"
+          pg_config --version
+          sudo systemctl start postgresql
+          sudo -u postgres createuser -s "$USER"
+
+      - name: Install deps
+        run: cpanm -n Alien::libpq EV EV::MakeMaker
+
+      - name: Build and test against libpq 14
+        env:
+          TEST_PG_CONNINFO: dbname=postgres
+        run: |
+          perl Makefile.PL
+          make
+          perl -Mblib -MEV::Pg -e 'my $v = EV::Pg->lib_version; print "runtime libpq $v\n"; $v < 150000 or die "not libpq 14\n"; EV::Pg->can("cancel_async") and die "libpq 17 method compiled in\n"'
+          make test
+
+  dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+          cpanm -n Alien::libpq EV EV::MakeMaker
+
+      - name: Build dist tarball and smoke-test it
+        run: |
+          perl Makefile.PL
+          make dist
+          tarball=$(ls -t EV-Pg-*.tar.gz | head -1)
+          echo "tarball: $tarball"
+          rm -rf /tmp/distcheck && mkdir -p /tmp/distcheck
+          tar -xzf "$tarball" -C /tmp/distcheck
+          cd /tmp/distcheck/EV-Pg-*
+          perl Makefile.PL
+          make
+          make install DESTDIR=/tmp/distcheck/root
+          perl -Mblib -MEV::Pg -e 'printf "tarball build OK, libpq %d\n", EV::Pg->lib_version'
+
   valgrind:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -90,6 +164,7 @@ jobs:
 
   test-alpine:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     container: alpine:latest
     steps:
       - uses: actions/checkout@v4
@@ -120,6 +195,7 @@ jobs:
 
   test-freebsd:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -143,6 +219,7 @@ jobs:
 
   test-openbsd:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
